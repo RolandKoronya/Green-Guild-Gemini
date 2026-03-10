@@ -84,8 +84,6 @@ if (!process.env.GEMINI_API_KEY) {
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// Safer production model choice for Cloud Run deployment
 const CHAT_MODEL_NAME = "gemini-2.5-flash";
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
@@ -100,6 +98,7 @@ function buildSystemPrompt() {
   if (!cachedSystemPrompt) {
     try {
       cachedSystemPrompt = fs.readFileSync(PROMPT_PATH, "utf8");
+      console.log(`✅ Prompt loaded: ${PROMPT_FILE}`);
     } catch (e) {
       console.warn(
         `[prompt] Could not read ${PROMPT_FILE}, using fallback prompt.`
@@ -160,12 +159,26 @@ async function saveUserProfile(key, bioText) {
 
 // -----------------------------
 // Knowledge base + retriever
+// Guarded so Cloud Run won't crash on startup
 // -----------------------------
-const kb = loadKB(path.join(process.cwd(), "kb_en"));
-const retriever = createRetriever(kb, {
-  geminiApiKey: process.env.GEMINI_API_KEY,
-});
+let kb = null;
+let retriever = null;
+let kbLoadError = null;
 
+try {
+  kb = loadKB(path.join(process.cwd(), "kb_en"));
+  retriever = createRetriever(kb, {
+    geminiApiKey: process.env.GEMINI_API_KEY,
+  });
+  console.log("✅ KB loaded successfully");
+} catch (e) {
+  kbLoadError = e;
+  console.error("❌ KB load failed:", e);
+}
+
+// -----------------------------
+// Query expansion
+// -----------------------------
 async function expandQueryWithAI(userQuery) {
   const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
 
@@ -180,7 +193,12 @@ async function expandQueryWithAI(userQuery) {
 // Endpoints
 // -----------------------------
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "The Green Tutor API" });
+  res.json({
+    ok: true,
+    service: "The Green Tutor API",
+    kbLoaded: !!retriever,
+    kbError: kbLoadError ? String(kbLoadError.message || kbLoadError) : null,
+  });
 });
 
 app.get("/get-profile", auth, async (req, res) => {
@@ -237,7 +255,9 @@ app.post("/chat", auth, async (req, res) => {
       ? await expandQueryWithAI(userText)
       : "plant image herbal identification";
 
-    const hits = await retriever.search(expandedQuery, { k: 6 });
+    const hits = retriever
+      ? await retriever.search(expandedQuery, { k: 6 })
+      : [];
 
     const contextBlock =
       hits.length > 0
@@ -248,7 +268,12 @@ app.post("/chat", auth, async (req, res) => {
       ? `\n\nUSER PROFILE (Remember these facts):\n${userBio}`
       : "";
 
-    const finalInstruction = `${buildSystemPrompt()}${bioBlock}${contextBlock}`;
+    const kbFallbackBlock =
+      !retriever && kbLoadError
+        ? `\n\nNOTE: The knowledge base is currently unavailable, so answer as carefully as possible without citing unavailable internal material.`
+        : "";
+
+    const finalInstruction = `${buildSystemPrompt()}${bioBlock}${contextBlock}${kbFallbackBlock}`;
 
     let recentHistory = dbHistory.slice(-MAX_CONTEXT).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
