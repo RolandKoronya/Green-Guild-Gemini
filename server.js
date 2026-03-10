@@ -1,4 +1,5 @@
 // server.js - THE GREEN TUTOR (English Edition)
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -17,12 +18,23 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "10mb" }));
 
-const db = new Firestore({
+// -----------------------------
+// Firestore (local + Cloud Run safe)
+// -----------------------------
+const firestoreConfig = {
   projectId: "green-tutor",
   databaseId: "(default)",
-  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-});
+};
 
+if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+  firestoreConfig.keyFilename = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+}
+
+const db = new Firestore(firestoreConfig);
+
+// -----------------------------
+// CORS
+// -----------------------------
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -41,12 +53,18 @@ app.use(
   })
 );
 
+// -----------------------------
+// Rate limit
+// -----------------------------
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
 });
 app.use(limiter);
 
+// -----------------------------
+// Auth
+// -----------------------------
 const PUBLIC_API_TOKEN =
   process.env.PUBLIC_API_TOKEN || "greentutor-secure-token";
 
@@ -58,11 +76,24 @@ function auth(req, res, next) {
   return next();
 }
 
+// -----------------------------
+// AI clients
+// -----------------------------
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY is missing.");
+}
+
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const CHAT_MODEL_NAME = "gemini-3.1-pro-preview";
+
+// Safer production model choice for Cloud Run deployment
+const CHAT_MODEL_NAME = "gemini-2.5-flash";
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
 
-const PROMPT_PATH = path.join(process.cwd(), "prompts", "base.en.md");
+// -----------------------------
+// Prompt loader
+// -----------------------------
+const PROMPT_FILE = process.env.PROMPT_FILE || "base.en.md";
+const PROMPT_PATH = path.join(process.cwd(), "prompts", PROMPT_FILE);
 let cachedSystemPrompt = null;
 
 function buildSystemPrompt() {
@@ -70,13 +101,19 @@ function buildSystemPrompt() {
     try {
       cachedSystemPrompt = fs.readFileSync(PROMPT_PATH, "utf8");
     } catch (e) {
+      console.warn(
+        `[prompt] Could not read ${PROMPT_FILE}, using fallback prompt.`
+      );
       cachedSystemPrompt =
-        "You are The Green Tutor. Answer based on the knowledge base provided.";
+        "You are The Green Tutor — a thoughtful, practical herbal mentor. Reply in English using British spelling.";
     }
   }
   return cachedSystemPrompt;
 }
 
+// -----------------------------
+// Memory
+// -----------------------------
 const MAX_CONTEXT = 24;
 const MAX_STORAGE = 100;
 
@@ -121,11 +158,37 @@ async function saveUserProfile(key, bioText) {
     );
 }
 
+// -----------------------------
+// Knowledge base + retriever
+// -----------------------------
+const kb = loadKB(path.join(process.cwd(), "kb_en"));
+const retriever = createRetriever(kb, {
+  geminiApiKey: process.env.GEMINI_API_KEY,
+});
+
+async function expandQueryWithAI(userQuery) {
+  const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
+
+  const result = await fastModel.generateContent(
+    `Identify herbal or botanical terms in: "${userQuery}". Provide Latin scientific names where relevant. Return ONLY keywords.`
+  );
+
+  return `${userQuery} ${result.response.text()}`;
+}
+
+// -----------------------------
+// Endpoints
+// -----------------------------
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "The Green Tutor API" });
+});
+
 app.get("/get-profile", auth, async (req, res) => {
   try {
     const bio = await loadUserProfile(getConversationKey(req));
     res.json({ ok: true, bio });
   } catch (e) {
+    console.error("Profile load error:", e);
     res.status(500).json({ error: "Failed to load profile." });
   }
 });
@@ -135,6 +198,7 @@ app.post("/update-profile", auth, async (req, res) => {
     await saveUserProfile(getConversationKey(req), req.body.bio || "");
     res.json({ ok: true });
   } catch (e) {
+    console.error("Profile update error:", e);
     res.status(500).json({ error: "Failed to update profile." });
   }
 });
@@ -148,22 +212,10 @@ app.get("/history", auth, async (req, res) => {
     }));
     res.json({ ok: true, messages });
   } catch (e) {
+    console.error("History load error:", e);
     res.status(500).json({ error: "Failed to load history." });
   }
 });
-
-const kb = loadKB(path.join(process.cwd(), "kb_en"));
-const retriever = createRetriever(kb, {
-  geminiApiKey: process.env.GEMINI_API_KEY,
-});
-
-async function expandQueryWithAI(userQuery) {
-  const fastModel = genAI.getGenerativeModel({ model: SEARCH_HELPER_MODEL });
-  const result = await fastModel.generateContent(
-    `Identify herbal or botanical terms in: "${userQuery}". Provide Latin scientific names where relevant. Return ONLY keywords.`
-  );
-  return `${userQuery} ${result.response.text()}`;
-}
 
 app.post("/chat", auth, async (req, res) => {
   try {
@@ -179,6 +231,7 @@ app.post("/chat", auth, async (req, res) => {
 
     const convKey = getConversationKey(req);
     const dbHistory = await loadSession(convKey);
+    const userBio = await loadUserProfile(convKey);
 
     const expandedQuery = userText
       ? await expandQueryWithAI(userText)
@@ -191,7 +244,6 @@ app.post("/chat", auth, async (req, res) => {
         ? `\n\nKNOWLEDGE BASE DATA:\n${hits.map((h) => h.text).join("\n")}`
         : "";
 
-    const userBio = await loadUserProfile(convKey);
     const bioBlock = userBio
       ? `\n\nUSER PROFILE (Remember these facts):\n${userBio}`
       : "";
@@ -222,7 +274,7 @@ app.post("/chat", auth, async (req, res) => {
 
     const result = imageBase64
       ? await chat.sendMessage([
-          { text: userText || "Analyze this image:" },
+          { text: userText || "Analyse this image:" },
           {
             inlineData: {
               mimeType: imageMime,
@@ -268,10 +320,9 @@ app.post("/chat", auth, async (req, res) => {
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "The Green Tutor API" });
-});
-
+// -----------------------------
+// Start server
+// -----------------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ The Green Tutor active on port ${PORT}`);
