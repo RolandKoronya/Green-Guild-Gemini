@@ -111,7 +111,7 @@ function buildSystemPrompt() {
 }
 
 // -----------------------------
-// Memory
+// Memory / Session
 // -----------------------------
 const MAX_CONTEXT = 24;
 const MAX_STORAGE = 100;
@@ -124,6 +124,7 @@ function getConversationKey(req) {
     : sessionId
     ? `session:${sessionId}`
     : `ip:${req.ip}`;
+
   return id.replace(/\//g, "_");
 }
 
@@ -139,22 +140,67 @@ async function saveSession(key, messages) {
   });
 }
 
-async function loadUserProfile(key) {
-  const doc = await db.collection("profiles_en").doc(key).get();
-  return doc.exists ? doc.data().bio || "" : "";
+// -----------------------------
+// Structured user profile
+// -----------------------------
+function emptyProfile() {
+  return {
+    constitution: "",
+    allergies: "",
+    medications: "",
+    preferredPreparations: "",
+    goals: "",
+    notes: "",
+  };
 }
 
-async function saveUserProfile(key, bioText) {
-  await db
-    .collection("profiles_en")
-    .doc(key)
-    .set(
-      {
-        bio: bioText,
-        updatedAt: new Date(),
-      },
-      { merge: true }
-    );
+async function loadUserProfile(key) {
+  const doc = await db.collection("profiles_en").doc(key).get();
+
+  if (!doc.exists) return emptyProfile();
+
+  const data = doc.data() || {};
+
+  return {
+    constitution: data.constitution || "",
+    allergies: data.allergies || "",
+    medications: data.medications || "",
+    preferredPreparations: data.preferredPreparations || "",
+    goals: data.goals || "",
+    notes: data.notes || "",
+  };
+}
+
+async function saveUserProfile(key, profile) {
+  const clean = {
+    constitution: profile?.constitution || "",
+    allergies: profile?.allergies || "",
+    medications: profile?.medications || "",
+    preferredPreparations: profile?.preferredPreparations || "",
+    goals: profile?.goals || "",
+    notes: profile?.notes || "",
+    updatedAt: new Date(),
+  };
+
+  await db.collection("profiles_en").doc(key).set(clean, { merge: true });
+}
+
+function buildProfileBlock(profile) {
+  if (!profile) return "";
+
+  const lines = [
+    profile.constitution ? `- Constitution: ${profile.constitution}` : "",
+    profile.allergies ? `- Allergies: ${profile.allergies}` : "",
+    profile.medications ? `- Medications: ${profile.medications}` : "",
+    profile.preferredPreparations
+      ? `- Preferred preparations: ${profile.preferredPreparations}`
+      : "",
+    profile.goals ? `- Goals: ${profile.goals}` : "",
+    profile.notes ? `- Notes: ${profile.notes}` : "",
+  ].filter(Boolean);
+
+  if (!lines.length) return "";
+  return `\n\nUSER PROFILE:\n${lines.join("\n")}`;
 }
 
 // -----------------------------
@@ -203,8 +249,8 @@ app.get("/health", (req, res) => {
 
 app.get("/get-profile", auth, async (req, res) => {
   try {
-    const bio = await loadUserProfile(getConversationKey(req));
-    res.json({ ok: true, bio });
+    const profile = await loadUserProfile(getConversationKey(req));
+    res.json({ ok: true, profile });
   } catch (e) {
     console.error("Profile load error:", e);
     res.status(500).json({ error: "Failed to load profile." });
@@ -213,7 +259,7 @@ app.get("/get-profile", auth, async (req, res) => {
 
 app.post("/update-profile", auth, async (req, res) => {
   try {
-    await saveUserProfile(getConversationKey(req), req.body.bio || "");
+    await saveUserProfile(getConversationKey(req), req.body.profile || {});
     res.json({ ok: true });
   } catch (e) {
     console.error("Profile update error:", e);
@@ -249,7 +295,7 @@ app.post("/chat", auth, async (req, res) => {
 
     const convKey = getConversationKey(req);
     const dbHistory = await loadSession(convKey);
-    const userBio = await loadUserProfile(convKey);
+    const userProfile = await loadUserProfile(convKey);
 
     const expandedQuery = userText
       ? await expandQueryWithAI(userText)
@@ -264,16 +310,14 @@ app.post("/chat", auth, async (req, res) => {
         ? `\n\nKNOWLEDGE BASE DATA:\n${hits.map((h) => h.text).join("\n")}`
         : "";
 
-    const bioBlock = userBio
-      ? `\n\nUSER PROFILE (Remember these facts):\n${userBio}`
-      : "";
+    const profileBlock = buildProfileBlock(userProfile);
 
     const kbFallbackBlock =
       !retriever && kbLoadError
         ? `\n\nNOTE: The knowledge base is currently unavailable, so answer as carefully as possible without citing unavailable internal material.`
         : "";
 
-    const finalInstruction = `${buildSystemPrompt()}${bioBlock}${contextBlock}${kbFallbackBlock}`;
+    const finalInstruction = `${buildSystemPrompt()}${profileBlock}${contextBlock}${kbFallbackBlock}`;
 
     let recentHistory = dbHistory.slice(-MAX_CONTEXT).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -319,14 +363,6 @@ app.post("/chat", auth, async (req, res) => {
         { role: "assistant", content: reply },
       ].slice(-MAX_STORAGE)
     );
-
-    if (userText && userText.toLowerCase().includes("remember this")) {
-      const updatedBio =
-        (userBio ? userBio + "\n" : "") +
-        "- " +
-        userText.replace(/remember this/gi, "").trim();
-      await saveUserProfile(convKey, updatedBio);
-    }
 
     res.json({ ok: true, answer: reply });
   } catch (e) {
