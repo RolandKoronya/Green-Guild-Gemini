@@ -86,6 +86,7 @@ if (!process.env.GEMINI_API_KEY) {
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const CHAT_MODEL_NAME = "gemini-2.5-flash";
 const SEARCH_HELPER_MODEL = "gemini-2.5-flash";
+const CLARIFIER_MODEL_NAME = "gemini-2.5-flash";
 
 // -----------------------------
 // Prompt loader
@@ -200,12 +201,11 @@ function buildProfileBlock(profile) {
   ].filter(Boolean);
 
   if (!lines.length) return "";
-  return `\n\nUSER PROFILE:\n${lines.join("\n")}`;
+  return `USER PROFILE:\n${lines.join("\n")}`;
 }
 
 // -----------------------------
 // Knowledge base + retriever
-// Guarded so Cloud Run won't crash on startup
 // -----------------------------
 let kb = null;
 let retriever = null;
@@ -233,6 +233,99 @@ async function expandQueryWithAI(userQuery) {
   );
 
   return `${userQuery} ${result.response.text()}`;
+}
+
+// -----------------------------
+// Clarification gate
+// -----------------------------
+function safeJsonParse(text, fallback = null) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+function recentHistoryForClarifier(dbHistory) {
+  return dbHistory
+    .slice(-6)
+    .map((m) => `${m.role}: ${m.content}`)
+    .join("\n");
+}
+
+async function getClarificationDecision({
+  userText,
+  userProfile,
+  dbHistory,
+}) {
+  if (!userText || !userText.trim()) {
+    return { shouldAsk: false, question: "", reason: "none" };
+  }
+
+  const model = genAI.getGenerativeModel({ model: CLARIFIER_MODEL_NAME });
+
+  const profileBlock = buildProfileBlock(userProfile) || "USER PROFILE:\n- none";
+  const historyBlock =
+    recentHistoryForClarifier(dbHistory) || "No recent history.";
+
+  const prompt = `
+You are deciding whether a herbal mentor should ask ONE clarifying question before answering.
+
+Return ONLY valid JSON in exactly this format:
+{
+  "shouldAsk": true,
+  "question": "Your question here",
+  "reason": "safety|goal|context|form|person|none"
+}
+
+Rules:
+- Ask a question only if the missing information would materially improve safety, accuracy, or relevance.
+- Ask at most ONE question.
+- Do not ask broad filler questions like "Can you tell me more?"
+- Do not ask for something already known from the user profile or recent history.
+- Prefer answering directly for general educational questions.
+- For dosage, herb-drug interactions, pregnancy, breastfeeding, children, prescription medicines, or serious illness, prioritise safety.
+- If no clarifying question is needed, return:
+  {"shouldAsk": false, "question": "", "reason": "none"}
+
+Examples of good clarifying questions:
+- "Is this for you, or for someone else?"
+- "Do you mean tea, tincture, or capsules?"
+- "Are any prescription medicines involved here?"
+- "Are you asking about the herb generally, or about using it in practice?"
+- "Is the main issue more dryness, stagnation, tension, or irritation?"
+
+${profileBlock}
+
+RECENT HISTORY:
+${historyBlock}
+
+USER MESSAGE:
+${userText}
+`;
+
+  try {
+    const result = await model.generateContent(prompt);
+    const raw = result.response.text().trim();
+
+    const parsed =
+      safeJsonParse(raw) ||
+      safeJsonParse(raw.replace(/```json|```/g, "").trim());
+
+    if (
+      parsed &&
+      typeof parsed.shouldAsk === "boolean" &&
+      typeof parsed.question === "string" &&
+      typeof parsed.reason === "string"
+    ) {
+      return parsed;
+    }
+
+    return { shouldAsk: false, question: "", reason: "none" };
+  } catch (e) {
+    console.error("Clarification decision failed:", e);
+    return { shouldAsk: false, question: "", reason: "none" };
+  }
 }
 
 // -----------------------------
@@ -297,6 +390,35 @@ app.post("/chat", auth, async (req, res) => {
     const dbHistory = await loadSession(convKey);
     const userProfile = await loadUserProfile(convKey);
 
+    // Ask a clarifying question only for text-based messages
+    if (userText && !imageBase64) {
+      const clarification = await getClarificationDecision({
+        userText,
+        userProfile,
+        dbHistory,
+      });
+
+      if (clarification.shouldAsk && clarification.question.trim()) {
+        await saveSession(
+          convKey,
+          [
+            ...dbHistory,
+            { role: "user", content: userText },
+            { role: "assistant", content: clarification.question.trim() },
+          ].slice(-MAX_STORAGE)
+        );
+
+        return res.json({
+          ok: true,
+          answer: clarification.question.trim(),
+          meta: {
+            askedClarifyingQuestion: true,
+            reason: clarification.reason,
+          },
+        });
+      }
+    }
+
     const expandedQuery = userText
       ? await expandQueryWithAI(userText)
       : "plant image herbal identification";
@@ -311,13 +433,14 @@ app.post("/chat", auth, async (req, res) => {
         : "";
 
     const profileBlock = buildProfileBlock(userProfile);
+    const formattedProfileBlock = profileBlock ? `\n\n${profileBlock}` : "";
 
     const kbFallbackBlock =
       !retriever && kbLoadError
         ? `\n\nNOTE: The knowledge base is currently unavailable, so answer as carefully as possible without citing unavailable internal material.`
         : "";
 
-    const finalInstruction = `${buildSystemPrompt()}${profileBlock}${contextBlock}${kbFallbackBlock}`;
+    const finalInstruction = `${buildSystemPrompt()}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
 
     let recentHistory = dbHistory.slice(-MAX_CONTEXT).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -364,7 +487,13 @@ app.post("/chat", auth, async (req, res) => {
       ].slice(-MAX_STORAGE)
     );
 
-    res.json({ ok: true, answer: reply });
+    res.json({
+      ok: true,
+      answer: reply,
+      meta: {
+        askedClarifyingQuestion: false,
+      },
+    });
   } catch (e) {
     console.error("Chat error:", e);
 
