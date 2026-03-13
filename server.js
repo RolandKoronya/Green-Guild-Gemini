@@ -236,7 +236,7 @@ async function expandQueryWithAI(userQuery) {
 }
 
 // -----------------------------
-// Clarification gate
+// Clarification + risk tier
 // -----------------------------
 function safeJsonParse(text, fallback = null) {
   try {
@@ -246,54 +246,75 @@ function safeJsonParse(text, fallback = null) {
   }
 }
 
-function recentHistoryForClarifier(dbHistory) {
+function recentHistoryForClassifier(dbHistory) {
   return dbHistory
     .slice(-6)
     .map((m) => `${m.role}: ${m.content}`)
     .join("\n");
 }
 
-async function getClarificationDecision({
+function normaliseRiskTier(tier) {
+  if (tier === "green" || tier === "yellow" || tier === "red") return tier;
+  return "green";
+}
+
+async function getGuidanceDecision({
   userText,
   userProfile,
   dbHistory,
 }) {
   if (!userText || !userText.trim()) {
-    return { shouldAsk: false, question: "", reason: "none" };
+    return {
+      shouldAsk: false,
+      question: "",
+      reason: "none",
+      riskTier: "green",
+    };
   }
 
   const model = genAI.getGenerativeModel({ model: CLARIFIER_MODEL_NAME });
 
   const profileBlock = buildProfileBlock(userProfile) || "USER PROFILE:\n- none";
   const historyBlock =
-    recentHistoryForClarifier(dbHistory) || "No recent history.";
+    recentHistoryForClassifier(dbHistory) || "No recent history.";
 
   const prompt = `
-You are deciding whether a herbal mentor should ask ONE clarifying question before answering.
+You are deciding how a herbal mentor should respond.
 
 Return ONLY valid JSON in exactly this format:
 {
   "shouldAsk": true,
   "question": "Your question here",
-  "reason": "safety|goal|context|form|person|none"
+  "reason": "safety|goal|context|form|person|none",
+  "riskTier": "green|yellow|red"
 }
 
+Definitions:
+- green = low-risk educational question, answer normally
+- yellow = personalised but caution-worthy, answer usefully with examples if appropriate, then brief caution at the end
+- red = acute/high-risk/medically sensitive, do not give a direct personal prescription, formula, tea recipe, or regimen, but still give useful educational reasoning and brief caution at the end
+
 Rules:
-- Ask a question only if the missing information would materially improve safety, accuracy, or relevance.
+- Ask a clarifying question only if the missing information would materially improve safety, accuracy, or relevance.
 - Ask at most ONE question.
 - Do not ask broad filler questions like "Can you tell me more?"
-- Do not ask for something already known from the user profile or recent history.
-- Prefer answering directly for general educational questions.
-- For dosage, herb-drug interactions, pregnancy, breastfeeding, children, prescription medicines, or serious illness, prioritise safety.
+- Do not ask for information already known from the user profile or recent history.
+- Prefer direct answers for general educational questions.
+- If the user is asking for direct personal use in a red-tier scenario, usually do NOT ask more questions unless one missing fact is essential. Instead, allow a red-tier educational response.
 - If no clarifying question is needed, return:
-  {"shouldAsk": false, "question": "", "reason": "none"}
+  {"shouldAsk": false, "question": "", "reason": "none", "riskTier": "green"}
 
-Examples of good clarifying questions:
-- "Is this for you, or for someone else?"
-- "Do you mean tea, tincture, or capsules?"
-- "Are any prescription medicines involved here?"
-- "Are you asking about the herb generally, or about using it in practice?"
-- "Is the main issue more dryness, stagnation, tension, or irritation?"
+Examples of red-tier situations:
+- high fever with significant symptoms
+- warfarin or anticoagulants plus direct personal recipe/request
+- multiple prescription medicines plus direct formula request
+- urgent-seeming serious symptoms
+- pregnancy/breastfeeding/children with significant symptoms and direct personal remedy request
+
+Examples of yellow-tier situations:
+- asking what herbs might suit their profile
+- asking which herbs fit their constitution
+- asking personal-use questions where caution matters but a useful educational answer is still clearly possible
 
 ${profileBlock}
 
@@ -318,14 +339,72 @@ ${userText}
       typeof parsed.question === "string" &&
       typeof parsed.reason === "string"
     ) {
-      return parsed;
+      return {
+        shouldAsk: parsed.shouldAsk,
+        question: parsed.question || "",
+        reason: parsed.reason || "none",
+        riskTier: normaliseRiskTier(parsed.riskTier),
+      };
     }
 
-    return { shouldAsk: false, question: "", reason: "none" };
+    return {
+      shouldAsk: false,
+      question: "",
+      reason: "none",
+      riskTier: "green",
+    };
   } catch (e) {
-    console.error("Clarification decision failed:", e);
-    return { shouldAsk: false, question: "", reason: "none" };
+    console.error("Guidance decision failed:", e);
+    return {
+      shouldAsk: false,
+      question: "",
+      reason: "none",
+      riskTier: "green",
+    };
   }
+}
+
+function buildRiskInstruction(riskTier) {
+  if (riskTier === "yellow") {
+    return `
+RISK TIER: YELLOW
+
+This is a personalised but caution-worthy case.
+Give a useful educational answer.
+Use the user's profile actively.
+Give candidate herbs or examples where appropriate if supported by the provided material.
+Explain why they fit the pattern.
+Avoid overconfident safety claims.
+Avoid precise dosage unless clearly safe and grounded in the provided material.
+Place any caution briefly at the end.
+Do not let the caution swallow the whole answer.
+`;
+  }
+
+  if (riskTier === "red") {
+    return `
+RISK TIER: RED
+
+This is an acute, high-risk, or medically sensitive case.
+Do NOT give a direct personal prescription, formula, tea recipe, or regimen.
+Do NOT say "here is what would work for you personally."
+However, do NOT collapse into a useless refusal.
+Still provide useful educational reasoning:
+- explain why the case is more cautious
+- explain how an herbalist would think about the pattern
+- discuss broad categories, formulation logic, gentle conceptual options, or relevant examples from the provided material when appropriate
+- avoid direct personal recipe language
+- end with a short, practical safety note
+Do not make "talk to your GP" the whole answer.
+`;
+  }
+
+  return `
+RISK TIER: GREEN
+
+This is a low-risk educational case.
+Answer normally and directly.
+`;
 }
 
 // -----------------------------
@@ -390,30 +469,37 @@ app.post("/chat", auth, async (req, res) => {
     const dbHistory = await loadSession(convKey);
     const userProfile = await loadUserProfile(convKey);
 
-    // Ask a clarifying question only for text-based messages
+    let decision = {
+      shouldAsk: false,
+      question: "",
+      reason: "none",
+      riskTier: "green",
+    };
+
     if (userText && !imageBase64) {
-      const clarification = await getClarificationDecision({
+      decision = await getGuidanceDecision({
         userText,
         userProfile,
         dbHistory,
       });
 
-      if (clarification.shouldAsk && clarification.question.trim()) {
+      if (decision.shouldAsk && decision.question.trim()) {
         await saveSession(
           convKey,
           [
             ...dbHistory,
             { role: "user", content: userText },
-            { role: "assistant", content: clarification.question.trim() },
+            { role: "assistant", content: decision.question.trim() },
           ].slice(-MAX_STORAGE)
         );
 
         return res.json({
           ok: true,
-          answer: clarification.question.trim(),
+          answer: decision.question.trim(),
           meta: {
             askedClarifyingQuestion: true,
-            reason: clarification.reason,
+            reason: decision.reason,
+            riskTier: decision.riskTier,
           },
         });
       }
@@ -440,7 +526,11 @@ app.post("/chat", auth, async (req, res) => {
         ? `\n\nNOTE: The knowledge base is currently unavailable, so answer as carefully as possible without citing unavailable internal material.`
         : "";
 
-    const finalInstruction = `${buildSystemPrompt()}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
+    const riskInstruction = buildRiskInstruction(decision.riskTier);
+
+    const finalInstruction = `${buildSystemPrompt()}
+
+${riskInstruction}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
 
     let recentHistory = dbHistory.slice(-MAX_CONTEXT).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -492,6 +582,7 @@ app.post("/chat", auth, async (req, res) => {
       answer: reply,
       meta: {
         askedClarifyingQuestion: false,
+        riskTier: decision.riskTier,
       },
     });
   } catch (e) {
