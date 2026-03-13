@@ -258,11 +258,162 @@ function normaliseRiskTier(tier) {
   return "green";
 }
 
-async function getGuidanceDecision({
-  userText,
-  userProfile,
-  dbHistory,
-}) {
+function normaliseText(value) {
+  return String(value || "").toLowerCase();
+}
+
+function combinedProfileText(profile) {
+  if (!profile) return "";
+  return [
+    profile.constitution,
+    profile.allergies,
+    profile.medications,
+    profile.preferredPreparations,
+    profile.goals,
+    profile.notes,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function countMedicationItems(medicationsText) {
+  const raw = String(medicationsText || "").trim();
+  if (!raw) return 0;
+
+  return raw
+    .split(/,|;|\n|\/|\band\b|\&/gi)
+    .map((s) => s.trim())
+    .filter(Boolean).length;
+}
+
+function detectSafetyFlags(profile = {}) {
+  const meds = normaliseText(profile.medications);
+  const allergies = normaliseText(profile.allergies);
+  const notes = normaliseText(profile.notes);
+  const constitution = normaliseText(profile.constitution);
+  const goals = normaliseText(profile.goals);
+
+  const haystack = [meds, allergies, notes, constitution, goals]
+    .filter(Boolean)
+    .join(" ");
+
+  const flags = [];
+
+  if (
+    /\bwarfarin\b|\banticoagulant\b|\bblood thinner\b|\bapixaban\b|\brivaroxaban\b|\bedoxaban\b|\bdabigatran\b|\bclopidogrel\b|\bantiplatelet\b/.test(
+      haystack
+    )
+  ) {
+    flags.push("anticoagulant_or_antiplatelet");
+  }
+
+  if (/\bpregnan/.test(haystack)) {
+    flags.push("pregnancy");
+  }
+
+  if (/\bbreast[\s-]?feeding\b|\bnursing\b|\blactation\b/.test(haystack)) {
+    flags.push("breastfeeding");
+  }
+
+  if (/\bseizure\b|\bepilep/.test(haystack)) {
+    flags.push("seizure_risk");
+  }
+
+  if (/\btransplant\b|\btacrolimus\b|\bcyclosporin\b|\bcyclosporine\b/.test(haystack)) {
+    flags.push("transplant_medicines");
+  }
+
+  if (/\bliver disease\b|\bcirrhosis\b|\bhepatitis\b|\bimpaired liver\b/.test(haystack)) {
+    flags.push("serious_liver_disease");
+  }
+
+  if (/\bkidney disease\b|\brenal\b|\bckd\b|\bimpaired kidney\b/.test(haystack)) {
+    flags.push("serious_kidney_disease");
+  }
+
+  if (
+    /\banaphyl/.test(allergies) ||
+    /\bsevere allerg/.test(allergies) ||
+    /\bepi[\s-]?pen\b/.test(allergies)
+  ) {
+    flags.push("severe_allergy");
+  }
+
+  if (countMedicationItems(profile.medications) >= 2) {
+    flags.push("multiple_prescription_medicines");
+  }
+
+  return Array.from(new Set(flags));
+}
+
+function isRemedyStyleQuestion(userText) {
+  const q = normaliseText(userText);
+
+  return (
+    /\btea\b|\btisane\b|\binfusion\b|\bdecoction\b|\btincture\b|\bblend\b|\bformula\b|\brecipe\b|\bremedy\b|\bherb(s)?\b|\bplant(s)?\b|\bwhat should i take\b|\bwhat can i take\b|\bwhat would you use\b|\bwhat do you recommend\b|\bgive me\b.*\btea\b|\bgive me\b.*\brecipe\b|\bmake me\b.*\bblend\b/.test(
+      q
+    ) ||
+    /\bfor anxiety\b|\bfor sleep\b|\bfor stress\b|\bfor digestion\b|\bfor pain\b|\bfor cold\b|\bfor flu\b/.test(
+      q
+    )
+  );
+}
+
+function isDirectPersonalUseRequest(userText) {
+  const q = normaliseText(userText);
+
+  return /\bi have\b|\bmy\b|\bfor me\b|\bbased on my profile\b|\bgiven my\b|\bcan i take\b|\bwhat should i take\b|\bgive me\b|\brecipe\b|\bblend\b/.test(
+    q
+  );
+}
+
+function buildSafetyOverride({ userText, userProfile, currentRiskTier }) {
+  const flags = detectSafetyFlags(userProfile);
+  const remedyStyle = isRemedyStyleQuestion(userText);
+  const personalUse = isDirectPersonalUseRequest(userText);
+
+  const hasMajorSafetyFactor = flags.length > 0;
+  const shouldForceRed = hasMajorSafetyFactor && remedyStyle && personalUse;
+
+  let riskTier = currentRiskTier || "green";
+  if (shouldForceRed) riskTier = "red";
+
+  let extraInstruction = "";
+  if (shouldForceRed) {
+    extraInstruction = `
+SAFETY OVERRIDE: HIGH-RISK PROFILE + REMEDY REQUEST
+
+The user profile contains one or more major safety factors:
+${flags.map((f) => `- ${f}`).join("\n")}
+
+Because the user is asking for a remedy-style or internal-use suggestion, you must answer in a more cautious red-tier style even if the broader discussion is educational.
+
+Important response rules for this answer:
+- You should still answer usefully and personally.
+- You may discuss gentler, simpler, lower-concern herbs, teas, or formulation directions in theory if supported by the provided Green Guild material.
+- Do NOT present any option as fully cleared, fully safe, or personally approved for this user.
+- Prefer language such as:
+  - "in theory"
+  - "lower-concern conceptually"
+  - "the gentler direction I'd think about"
+  - "educational guidance rather than medical advice"
+- Acknowledge early that the profile changes the level of caution.
+- Avoid broad, confident, free-flowing recipe language.
+- If you mention a blend or shortlist, keep it simple, cautious, and clearly theoretical.
+- End with a short practical note telling the user to check actual use with their GP, pharmacist, or suitable clinician first.
+`;
+  }
+
+  return {
+    riskTier,
+    flags,
+    shouldForceRed,
+    extraInstruction,
+  };
+}
+
+async function getGuidanceDecision({ userText, userProfile, dbHistory }) {
   if (!userText || !userText.trim()) {
     return {
       shouldAsk: false,
@@ -292,7 +443,7 @@ Return ONLY valid JSON in exactly this format:
 Definitions:
 - green = low-risk educational question, answer normally
 - yellow = personalised but caution-worthy, answer usefully with examples if appropriate, then brief caution at the end
-- red = acute/high-risk/medically sensitive, do not give a direct personal prescription, formula, tea recipe, or regimen, but still give useful educational reasoning and brief caution at the end
+- red = acute/high-risk/medically sensitive, still answer helpfully and educationally, but with stronger caution and without overconfident personal prescribing
 
 Rules:
 - Ask a clarifying question only if the missing information would materially improve safety, accuracy, or relevance.
@@ -385,15 +536,19 @@ Do not let the caution swallow the whole answer.
     return `
 RISK TIER: RED
 
-This is an acute, high-risk, or medically sensitive case.
-Do NOT give a direct personal prescription, formula, tea recipe, or regimen.
-Do NOT say "here is what would work for you personally."
-However, do NOT collapse into a useless refusal.
-Still provide useful educational reasoning:
-- explain why the case is more cautious
+This is a high-risk or medically sensitive case.
+Do NOT collapse into a refusal.
+Do NOT give casual, overconfident, or fully personalised prescribing language.
+Do NOT present herbs as fully safe, fully cleared, or personally approved.
+
+You should still be useful:
+- acknowledge briefly that the profile changes the level of caution
 - explain how an herbalist would think about the pattern
-- discuss broad categories, formulation logic, gentle conceptual options, or relevant examples from the provided material when appropriate
-- avoid direct personal recipe language
+- personalise the reasoning using the user profile
+- discuss gentler, simpler, lower-concern options in theory when supported by the provided material
+- if relevant, you may mention a cautious shortlist, blend direction, or tea direction in theory, but keep it simple and clearly educational rather than prescriptive
+- prefer wording like "in theory", "lower-concern conceptually", and "the gentler direction I'd think about"
+- avoid precise dosage unless clearly safe and grounded in the provided material
 - end with a short, practical safety note
 Do not make "talk to your GP" the whole answer.
 `;
@@ -482,27 +637,40 @@ app.post("/chat", auth, async (req, res) => {
         userProfile,
         dbHistory,
       });
+    }
 
-      if (decision.shouldAsk && decision.question.trim()) {
-        await saveSession(
-          convKey,
-          [
-            ...dbHistory,
-            { role: "user", content: userText },
-            { role: "assistant", content: decision.question.trim() },
-          ].slice(-MAX_STORAGE)
-        );
+    const safetyOverride = buildSafetyOverride({
+      userText,
+      userProfile,
+      currentRiskTier: decision.riskTier,
+    });
 
-        return res.json({
-          ok: true,
-          answer: decision.question.trim(),
-          meta: {
-            askedClarifyingQuestion: true,
-            reason: decision.reason,
-            riskTier: decision.riskTier,
-          },
-        });
-      }
+    decision = {
+      ...decision,
+      riskTier: safetyOverride.riskTier,
+    };
+
+    if (userText && !imageBase64 && decision.shouldAsk && decision.question.trim()) {
+      await saveSession(
+        convKey,
+        [
+          ...dbHistory,
+          { role: "user", content: userText },
+          { role: "assistant", content: decision.question.trim() },
+        ].slice(-MAX_STORAGE)
+      );
+
+      return res.json({
+        ok: true,
+        answer: decision.question.trim(),
+        meta: {
+          askedClarifyingQuestion: true,
+          reason: decision.reason,
+          riskTier: decision.riskTier,
+          safetyFlags: safetyOverride.flags,
+          safetyOverrideApplied: safetyOverride.shouldForceRed,
+        },
+      });
     }
 
     const expandedQuery = userText
@@ -527,10 +695,13 @@ app.post("/chat", auth, async (req, res) => {
         : "";
 
     const riskInstruction = buildRiskInstruction(decision.riskTier);
+    const safetyOverrideInstruction = safetyOverride.extraInstruction
+      ? `\n\n${safetyOverride.extraInstruction}`
+      : "";
 
     const finalInstruction = `${buildSystemPrompt()}
 
-${riskInstruction}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
+${riskInstruction}${safetyOverrideInstruction}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
 
     let recentHistory = dbHistory.slice(-MAX_CONTEXT).map((m) => ({
       role: m.role === "assistant" ? "model" : "user",
@@ -583,6 +754,8 @@ ${riskInstruction}${formattedProfileBlock}${contextBlock}${kbFallbackBlock}`;
       meta: {
         askedClarifyingQuestion: false,
         riskTier: decision.riskTier,
+        safetyFlags: safetyOverride.flags,
+        safetyOverrideApplied: safetyOverride.shouldForceRed,
       },
     });
   } catch (e) {
